@@ -32,6 +32,14 @@ const CONFIG = {
       address: '0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef',
       fromBlock: 44394724,
       skipIndexer: false,
+    },
+    {
+      // V3 CL factory, live 2026-10-21. Addresses from the Aerodrome team:
+      // https://gist.githubusercontent.com/simplyoptimistic/f0d67b6fcaef3470f8589cb0d3cf4806/raw/fb2b8095869d5c8d2fe014f5825bff7047d062f8/setup-addresses.json
+      address: '0x9CB220581b91b0C83223012FE69688b92aD07a76',
+      fromBlock: 52885483, // first V3 PoolCreated
+      skipIndexer: false,
+      v3: true,
     }
   ],
   voter: '0x16613524e02ad97eDfeF371bC883F2F5d6C480A5',
@@ -61,6 +69,12 @@ const abis = {
   // the staked-LP share plus the unstaked-LP rake routed to the gauge.  Resets when
   // collectFees() is called.
   gaugeFees: 'function gaugeFees() view returns (uint128 token0, uint128 token1)',
+  // V3 pools take the swap fee from a hook (dynamic fee plus MEV tax), so fee() is only
+  // the base rate. The hook records every swap's fee on the CL pool tape (verified source
+  // DynamicSwapFeeHook.afterSwap): cumulativeFee is the dynamic fee, cumulativeMevFee the
+  // MEV tax, both charged to the trader.
+  clPoolTape: 'address:clPoolTape',
+  tapeAccumulators: 'function accumulators(address) view returns ((uint40 lastSwapTimestamp, uint40 lastObservationTimestamp, uint32 swapCount, int24 lastTick, int24 intervalMaxTick, int24 intervalMinTick, int24 intervalOpenTick, uint48 volatilityCorrob, uint120 cumulativeVolume0, uint120 cumulativeVolume1, uint16 intervalSwapCount, uint120 cumulativeFee0, uint120 cumulativeFee1, uint8 volatilityRingHead, uint8 volatilityRingCount, uint120 cumulativeMevVolume0, uint120 cumulativeMevVolume1, uint8 nOver, uint120 cumulativeMevFee0, uint120 cumulativeMevFee1))',
 }
 
 const getGaugeMetadata = async (
@@ -119,9 +133,12 @@ const fetch = async (fetchOptions: FetchOptions): Promise<FetchResult> => {
   const { bribeSet } = await getGaugeMetadata(fetchOptions)
 
   let rawPools: Array<any> = []
+  const v3Pools = new Set<string>()
   for (const factory of CONFIG.factories) {
+    if (factory.fromBlock > toBlock) continue
     const factoryLogs = await getLogs({ target: factory.address, fromBlock: factory.fromBlock, toBlock, eventAbi: eventAbis.event_poolCreated, skipIndexer: factory.skipIndexer, cacheInCloud: true, })
     rawPools = rawPools.concat(factoryLogs)
+    if (factory.v3) factoryLogs.forEach((l: any) => v3Pools.add(l.pool.toLowerCase()))
   }
 
   // ignore pools holding blacklisted (scam/wash-traded) tokens - everything
@@ -214,6 +231,30 @@ const fetch = async (fetchOptions: FetchOptions): Promise<FetchResult> => {
 
   if (errorFound) throw errorFound
 
+  // V3 pools: replace the fee() estimate with the tape's cumulative fee delta over the window
+  const v3PoolList = _pools.filter(p => v3Pools.has(p))
+  if (v3PoolList.length) {
+    const v3Factory = CONFIG.factories.find(f => f.v3)!
+    // ponytail: tape read at the window end; a tape swap mid-window undercounts that window
+    const tape = await api.call({ target: v3Factory.address, abi: abis.clPoolTape })
+    const calls = v3PoolList.map(p => ({ params: [p] }))
+    const [tapeStart, tapeEnd] = await Promise.all([
+      // no V3 pool existed before its first PoolCreated, so nothing to subtract
+      fromBlock < v3Factory.fromBlock ? Promise.resolve(calls.map(() => null)) : fromApi.multiCall({ target: tape, abi: abis.tapeAccumulators, calls }),
+      api.multiCall({ target: tape, abi: abis.tapeAccumulators, calls }),
+    ])
+    const totalFee = (t: any, k: 0 | 1) => Number(t[`cumulativeFee${k}`]) + Number(t[`cumulativeMevFee${k}`])
+    v3PoolList.forEach((pool, i) => {
+      // the tape discards pre-seeded values on a pool's first swap, so count from zero until then
+      const start = Number(tapeStart[i]?.lastSwapTimestamp ?? 0) > 0 ? tapeStart[i] : null
+      const end = tapeEnd[i]
+      poolFeeTotals[pool] = {
+        fee0: totalFee(end, 0) - (start ? totalFee(start, 0) : 0),
+        fee1: totalFee(end, 1) - (start ? totalFee(start, 1) : 0),
+      }
+    })
+  }
+
   // Drains of gaugeFees in [fromBlock, toBlock]: needed so gaugeFees(end) - gaugeFees(start)
   // doesn't go negative across an epoch boundary where collectFees() was called.
   const collectIface = new ethers.Interface([eventAbis.event_collect_fees])
@@ -297,28 +338,28 @@ const prefetch: any = async (options: FetchOptions) => {
 }
 
 const methodology = {
-  Volume: 'Swap volume, excluding wash trading: pools whose daily trades come from too few distinct addresses to be organic, unless every pool token is a core asset or CoinGecko-listed.',
-  Fees: "Total swap fees paid by traders. Per-pool fee rate read from CLPool.fee() (tickSpacing-based default, customizable) applied to each swap's input amount.",
-  Revenue: "veAERO holders' share of swap fees, equal to HoldersRevenue (Aerodrome's zero-leak model routes all protocol revenue to voters).",
-  HoldersRevenue: "Sum of (a) staked-LP fees and (b) the unstaked-LP rake (CLFactory.getUnstakedFee, default 10% of unstaked share), both routed into the gauge's CLPool.gaugeFees() accumulator. Measured on-chain as gaugeFees(toBlock) - gaugeFees(fromBlock) plus CollectFees event amounts (which drain the accumulator each Voter.distribute call).",
-  SupplySideRevenue: "Unstaked LPs' net share of swap fees after the rake, accruing via the pool's feeGrowthGlobal. Computed per pool as Fees - HoldersRevenue.",
+  Volume: 'Swap volume on Aerodrome Slipstream (concentrated liquidity) pools, excluding wash trading.',
+  Fees: 'Swap fees paid by traders, plus bribes deposited for veAERO voters.',
+  Revenue: 'Swap fees earned by liquidity staked in gauges and the fee cut taken from unstaked liquidity, plus bribes, all distributed to veAERO voters.',
+  HoldersRevenue: 'Swap fees earned by liquidity staked in gauges and the fee cut taken from unstaked liquidity, plus bribes, all distributed to veAERO voters.',
+  SupplySideRevenue: 'Swap fees kept by liquidity providers that do not stake in a gauge, after the unstaked fee cut.',
 }
 
 const breakdownMethodology = {
   Fees: {
-    'Token Swap Fees': 'All swap fees paid by traders on Aerodrome Slipstream pools.',
-    'External Bribes Rewards': "External bribes deposited to BribeVotingReward contracts (NotifyReward events filtered to slipstream GaugeFactories). Pre-launch tokens are priced via hardcoded conversion rates until each token's cutoff timestamp; afterwards DefiLlama spot pricing is used.",
+    'Token Swap Fees': 'Swap fees paid by traders.',
+    'External Bribes Rewards': 'Bribes deposited for veAERO voters.',
   },
   Revenue: {
-    'Staked-LP Fees And Unstaked-LP Rake': "Both flow into the gauge's gaugeFees accumulator and are distributed to veAERO voters via FeeVotingReward.",
-    'External Bribes Revenue': "External bribes deposited to BribeVotingReward contracts (NotifyReward events filtered to slipstream GaugeFactories). Pre-launch tokens are priced via hardcoded conversion rates until each token's cutoff timestamp; afterwards DefiLlama spot pricing is used.",
+    'Staked-LP Fees And Unstaked-LP Rake': 'Swap fees earned by liquidity staked in gauges and the fee cut taken from unstaked liquidity, distributed to veAERO voters.',
+    'External Bribes Revenue': 'Bribes distributed to veAERO voters.',
   },
   HoldersRevenue: {
-    'Staked-LP Fees And Unstaked-LP Rake': "Both flow into the gauge's gaugeFees accumulator and are distributed to veAERO voters via FeeVotingReward.",
-    'External Bribes Revenue': "External bribes deposited to BribeVotingReward contracts (NotifyReward events filtered to slipstream GaugeFactories). Pre-launch tokens are priced via hardcoded conversion rates until each token's cutoff timestamp; afterwards DefiLlama spot pricing is used.",
+    'Staked-LP Fees And Unstaked-LP Rake': 'Swap fees earned by liquidity staked in gauges and the fee cut taken from unstaked liquidity, distributed to veAERO voters.',
+    'External Bribes Revenue': 'Bribes distributed to veAERO voters.',
   },
   SupplySideRevenue: {
-    'Unstaked-LP Fees': "Unstaked LPs' pro-rata share of swap fees, net of the unstaked-LP rake redirected to the gauge.",
+    'Unstaked-LP Fees': 'Swap fees kept by liquidity providers that do not stake in a gauge, after the unstaked fee cut.',
   },
 }
 
